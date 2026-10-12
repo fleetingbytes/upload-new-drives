@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import contextlib
+import os
 import sys
 import time
 import traceback
@@ -36,7 +37,6 @@ except ImportError as e:
     traceback.print_exc()
     sys.exit(1)
 
-import os
 import requests
 
 UPLOAD_ATTR_NAME = "user.upload"
