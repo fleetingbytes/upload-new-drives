@@ -1,0 +1,48 @@
+line-length = 108
+
+[format]
+line-ending = "lf"
+docstring-code-format = true
+
+[lint]
+preview = true
+select = [
+    "B",       # flake8-bugbear
+    "C901",    # mcabe
+    "E",       # pycodestyle errors
+    "ERA",     # eradicate (commented-out-code)
+    "F",       # pyflakes
+    "FLY",     # flynt
+    "G",       # flake8-logging-format
+    "I",       # isort
+    "ICN",     # flake8-import-conventions
+    "INT",     # flake8-gettext
+    "ISC",     # flake8-implicit-str-concat
+    "LOG",     # flake8-logging
+    "N",       # pep8-naming
+    "PERF",    # Perflint
+    "PL",      # pylint
+    "Q",       # quotes
+    "RUF",     # ruff-specific rules
+    "SIM",     # flake8-simplify
+    "TC",      # flake8-type-checking
+    "TID251",  # banned-api
+    "TID253",  # banned-module-level-imports
+    "UP",      # pyupgrade
+    "W",       # pycodestyle warnings
+]
+
+extend-safe-fixes = [
+    "TC001",  # typing-only-first-party-import
+    "TC002",  # typing-only-third-party-import
+    "TC003",  # typing-only-standard-library-import
+    "TC004",  # runtime-import-in-type-checking-block
+]
+
+[lint.per-file-ignores]
+"src/**/cli/__init__.py" = [
+    "N813",  # camelcase-imported-as-lowercase
+]
+
+[lint.mccabe]
+max-complexity = 5
