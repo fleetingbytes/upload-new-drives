@@ -10,11 +10,13 @@ Usage:
 """
 
 import argparse
+import asyncio
 import contextlib
 import os
 import sys
 import time
 import traceback
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,7 +25,7 @@ try:
     from openpilot.common.hardware.hw import Paths
     from openpilot.common.params import Params
     from openpilot.common.utils import get_upload_stream
-    from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
+    from openpilot.system.loggerd.xattr_cache import setxattr
 except ImportError as e:
     print("Error: Could not import openpilot modules.")
     print(f"Import error: {e}")
@@ -45,6 +47,7 @@ UPLOAD_ATTR_VALUE = b"1"
 HTTP_OK = 200
 HTTP_CREATED = 201
 HTTP_PRECONDITION_FAILED = 412
+HTTP_NOT_FOUND = 404
 SUCCESS_CODES = {HTTP_OK, HTTP_CREATED}
 
 # Files we care about for a "full" upload (qlogs/qcameras are usually already uploaded)
@@ -57,12 +60,14 @@ DEFAULT_FILES = (
 
 DCAMERA = "dcamera.hevc"
 
-
-def is_uploaded(path: str) -> bool:
-    try:
-        return getxattr(path, UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE
-    except OSError:
-        return False
+# Map local filename to the key used in the /files response
+FILE_TO_SERVER_KEY = {
+    "rlog": "logs",
+    "rlog.zst": "logs",
+    "fcamera.hevc": "cameras",
+    "ecamera.hevc": "ecameras",
+    "dcamera.hevc": "dcameras",
+}
 
 
 def _is_recent(path: Path, cutoff: datetime) -> bool:
@@ -74,41 +79,127 @@ def _is_recent(path: Path, cutoff: datetime) -> bool:
     return mtime >= cutoff
 
 
-def _collect_from_segment(seg_dir: Path, interesting: list[str]) -> list[tuple[str, str]]:
-    """Look for interesting files directly inside a segment directory.
-
-    The relative key matches openpilot's Uploader: ``segdir/filename``.
-    """
-    found = []
-    for fname in interesting:
-        fpath = seg_dir / fname
-        if fpath.is_file() and not is_uploaded(str(fpath)):
-            rel = f"{seg_dir.name}/{fname}"
-            found.append((rel, str(fpath)))
-    return found
+def _parse_segment_dir(name: str) -> tuple[str, int] | None:
+    """Return (route_part, segment_num) or None if the name is not a segment dir."""
+    parts = name.rsplit("--", 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        return None
+    return parts[0], int(parts[1])
 
 
-def find_unuploaded(root: Path, max_days: int, include_dcamera: bool) -> list[tuple[str, str]]:
-    """Return list of (relative_key, absolute_path) for files that need uploading."""
+def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> dict[str, list[tuple[str, str, int]]]:
+    """Return {route_part: [(key, path, segment), ...]}."""
+    by_route: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
     if not root.is_dir():
         print(f"Log root not found: {root}")
+        return by_route
+
+    for seg_dir in sorted(root.iterdir(), reverse=True):
+        if not seg_dir.is_dir() or not _is_recent(seg_dir, cutoff):
+            continue
+        parsed = _parse_segment_dir(seg_dir.name)
+        if parsed is None:
+            continue
+        route_part, segment = parsed
+        for fname in interesting:
+            fpath = seg_dir / fname
+            if fpath.is_file():
+                key = f"{seg_dir.name}/{fname}"
+                by_route[route_part].append((key, str(fpath), segment))
+    return by_route
+
+
+def _server_has_file(files_resp: dict, fname: str, segment: int) -> bool:
+    """True if the server response indicates this segment/file is already uploaded."""
+    server_key = FILE_TO_SERVER_KEY.get(fname)
+    if not server_key:
+        return False
+    urls = files_resp.get(server_key, [])
+    # Arrays are sorted by segment number; index matches segment when present
+    return isinstance(urls, list) and segment < len(urls) and bool(urls[segment])
+
+
+async def _query_route_files(api: Api, dongle_id: str, route_part: str) -> dict | None:
+    """Fetch the /files endpoint for one route. Returns the JSON or None on error."""
+    route_name = f"{dongle_id}|{route_part}"
+    endpoint = f"v1/route/{route_name}/files"
+    try:
+        # Run the blocking request in a thread so we can gather many of them
+        resp = await asyncio.to_thread(
+            api.get,
+            endpoint,
+            timeout=20,
+            access_token=api.get_token(),
+        )
+    except Exception as e:
+        print(f"  warning: could not query {route_name}: {e}")
+        return None
+
+    if resp.status_code == HTTP_NOT_FOUND:
+        return {}
+    if resp.status_code != HTTP_OK:
+        print(f"  warning: {endpoint} returned HTTP {resp.status_code}")
+        return None
+    try:
+        return resp.json()
+    except Exception as e:
+        print(f"  warning: bad JSON from {endpoint}: {e}")
+        return None
+
+
+async def _filter_by_server(
+    api: Api,
+    dongle_id: str,
+    by_route: dict[str, list[tuple[str, str, int]]],
+) -> list[tuple[str, str]]:
+    """Concurrently query each route and keep only files the server does not have."""
+    if not by_route:
         return []
 
+    # Limit concurrency so we stay well under the 5/min rate limit on /files
+    sem = asyncio.Semaphore(3)
+
+    async def bounded_query(route_part: str) -> tuple[str, dict | None]:
+        async with sem:
+            result = await _query_route_files(api, dongle_id, route_part)
+            await asyncio.sleep(0.2)  # small stagger
+            return route_part, result
+
+    tasks = [bounded_query(rp) for rp in by_route]
+    results = await asyncio.gather(*tasks)
+
+    missing: list[tuple[str, str]] = []
+    for route_part, files_resp in results:
+        if files_resp is None:
+            # Could not determine status – skip rather than risk re-uploading everything
+            print(f"  skipping route {route_part} (server query failed)")
+            continue
+        for key, path, segment in by_route[route_part]:
+            fname = key.rsplit("/", 1)[-1]
+            if not _server_has_file(files_resp, fname, segment):
+                missing.append((key, path))
+    return missing
+
+
+def find_unuploaded(
+    api: Api,
+    dongle_id: str,
+    root: Path,
+    max_days: int,
+    include_dcamera: bool,
+) -> list[tuple[str, str]]:
+    """Return list of (relative_key, absolute_path) that the server does not yet have."""
     cutoff = datetime.now() - timedelta(days=max_days)
     interesting = list(DEFAULT_FILES)
     if include_dcamera:
         interesting.append(DCAMERA)
 
-    results: list[tuple[str, str]] = []
-    # realdata layout is flat: each child is a segment directory named route--segment
-    for seg_dir in sorted(root.iterdir(), reverse=True):
-        if not seg_dir.is_dir():
-            continue
-        if not _is_recent(seg_dir, cutoff):
-            continue
-        results.extend(_collect_from_segment(seg_dir, interesting))
+    by_route = _collect_local(root, interesting, cutoff)
+    if not by_route:
+        return []
 
-    return results
+    print(f"Querying server for {len(by_route)} route(s)...")
+    return asyncio.run(_filter_by_server(api, dongle_id, by_route))
 
 
 def _mark_uploaded(fn: str) -> None:
@@ -199,6 +290,16 @@ def _print_files(files: list[tuple[str, str]]) -> None:
         print(f"  {key}")
 
 
+def _do_uploads(api: Api, dongle_id: str, files: list[tuple[str, str]], dry_run: bool) -> int:
+    success = 0
+    for key, fn in files:
+        if upload_file(api, dongle_id, key, fn, dry_run):
+            success += 1
+        if not dry_run:
+            time.sleep(0.5)
+    return success
+
+
 def main() -> None:
     args = _parse_args()
     dongle_id = _get_dongle_id()
@@ -208,7 +309,8 @@ def main() -> None:
     print(f"Log root:  {root}")
     print(f"Scanning last {args.days} days...")
 
-    files = find_unuploaded(root, args.days, args.include_dcamera)
+    api = Api(dongle_id)
+    files = find_unuploaded(api, dongle_id, root, args.days, args.include_dcamera)
     if not files:
         print("No unuploaded files found.")
         return
@@ -216,13 +318,7 @@ def main() -> None:
     _print_files(files)
     print()
 
-    api = Api(dongle_id)
-    success = 0
-    for key, fn in files:
-        if upload_file(api, dongle_id, key, fn, args.dry_run):
-            success += 1
-        if not args.dry_run:
-            time.sleep(0.5)
+    success = _do_uploads(api, dongle_id, files, args.dry_run)
 
     if args.dry_run:
         print(f"\nDry run - nothing uploaded ({success}/{len(files)} files).")
