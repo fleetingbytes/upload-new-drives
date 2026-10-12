@@ -75,18 +75,15 @@ def _is_recent(path: Path, cutoff: datetime) -> bool:
 
 
 def _collect_from_segment(seg_dir: Path, interesting: list[str]) -> list[tuple[str, str]]:
-    """Look for interesting files directly inside a segment directory."""
+    """Look for interesting files directly inside a segment directory.
+
+    The relative key matches openpilot's Uploader: ``segdir/filename``.
+    """
     found = []
-    # Relative key used by the API: route/segment/filename
-    # Segment dir name is already "route--segment"
-    parts = seg_dir.name.rsplit("--", 1)
-    if len(parts) != 2:
-        return found
-    route, segment = parts
     for fname in interesting:
         fpath = seg_dir / fname
         if fpath.is_file() and not is_uploaded(str(fpath)):
-            rel = f"{route}/{segment}/{fname}"
+            rel = f"{seg_dir.name}/{fname}"
             found.append((rel, str(fpath)))
     return found
 
