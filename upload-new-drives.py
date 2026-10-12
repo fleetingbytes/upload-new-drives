@@ -65,37 +65,30 @@ def is_uploaded(path: str) -> bool:
         return False
 
 
-def _route_is_recent(route_name: str, cutoff: datetime) -> bool:
+def _is_recent(path: Path, cutoff: datetime) -> bool:
+    """True if the path's mtime is newer than the cutoff."""
     try:
-        route_date = datetime.strptime(route_name[:10], "%Y-%m-%d")
-    except ValueError:
-        return True
-    return route_date >= cutoff
+        mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return False
+    return mtime >= cutoff
 
 
-def _collect_from_segment(route_name: str, seg_dir: Path, interesting: list[str]) -> list[tuple[str, str]]:
+def _collect_from_segment(seg_dir: Path, interesting: list[str]) -> list[tuple[str, str]]:
+    """Look for interesting files directly inside a segment directory."""
     found = []
+    # Relative key used by the API: route/segment/filename
+    # Segment dir name is already "route--segment"
+    parts = seg_dir.name.rsplit("--", 1)
+    if len(parts) != 2:
+        return found
+    route, segment = parts
     for fname in interesting:
         fpath = seg_dir / fname
         if fpath.is_file() and not is_uploaded(str(fpath)):
-            rel = f"{route_name}/{seg_dir.name}/{fname}"
+            rel = f"{route}/{segment}/{fname}"
             found.append((rel, str(fpath)))
     return found
-
-
-def _scan_route(route_dir: Path, interesting: list[str]) -> list[tuple[str, str]]:
-    results = []
-    for seg_dir in sorted(route_dir.iterdir()):
-        if not seg_dir.is_dir():
-            continue
-        results.extend(_collect_from_segment(route_dir.name, seg_dir, interesting))
-    return results
-
-
-def _should_scan_route(route_dir: Path, cutoff: datetime) -> bool:
-    if not route_dir.is_dir() or not route_dir.name[0].isdigit():
-        return False
-    return _route_is_recent(route_dir.name, cutoff)
 
 
 def find_unuploaded(root: Path, max_days: int, include_dcamera: bool) -> list[tuple[str, str]]:
@@ -110,10 +103,13 @@ def find_unuploaded(root: Path, max_days: int, include_dcamera: bool) -> list[tu
         interesting.append(DCAMERA)
 
     results: list[tuple[str, str]] = []
-    for route_dir in sorted(root.iterdir(), reverse=True):
-        if not _should_scan_route(route_dir, cutoff):
+    # realdata layout is flat: each child is a segment directory named route--segment
+    for seg_dir in sorted(root.iterdir(), reverse=True):
+        if not seg_dir.is_dir():
             continue
-        results.extend(_scan_route(route_dir, interesting))
+        if not _is_recent(seg_dir, cutoff):
+            continue
+        results.extend(_collect_from_segment(seg_dir, interesting))
 
     return results
 
