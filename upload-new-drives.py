@@ -20,9 +20,9 @@ from pathlib import Path
 
 try:
     from openpilot.common.api import Api
+    from openpilot.common.hardware.hw import Paths
     from openpilot.common.params import Params
     from openpilot.common.utils import get_upload_stream
-    from openpilot.common.hardware.hw import Paths
     from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
 except ImportError as e:
     print("Error: Could not import openpilot modules.")
