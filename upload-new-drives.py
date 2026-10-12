@@ -214,18 +214,20 @@ def main() -> None:
         return
 
     _print_files(files)
-    if args.dry_run:
-        print("\nDry run - nothing uploaded.")
-        return
+    print()
 
     api = Api(dongle_id)
     success = 0
     for key, fn in files:
         if upload_file(api, dongle_id, key, fn, args.dry_run):
             success += 1
-        time.sleep(0.5)
+        if not args.dry_run:
+            time.sleep(0.5)
 
-    print(f"\nDone. {success}/{len(files)} uploaded successfully.")
+    if args.dry_run:
+        print(f"\nDry run - nothing uploaded ({success}/{len(files)} files).")
+    else:
+        print(f"\nDone. {success}/{len(files)} uploaded successfully.")
 
 
 if __name__ == "__main__":
