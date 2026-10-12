@@ -16,7 +16,6 @@ import os
 import sys
 import time
 import traceback
-from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -47,10 +46,11 @@ UPLOAD_ATTR_VALUE = b"1"
 HTTP_OK = 200
 HTTP_CREATED = 201
 HTTP_PRECONDITION_FAILED = 412
-HTTP_NOT_FOUND = 404
 SUCCESS_CODES = {HTTP_OK, HTTP_CREATED}
 
 SEGMENT_PARTS = 2
+PROBE_TIMEOUT = 10
+PROBE_CONCURRENCY = 6
 
 # Files we care about for a "full" upload (qlogs/qcameras are usually already uploaded)
 DEFAULT_FILES = (
@@ -62,17 +62,6 @@ DEFAULT_FILES = (
 
 DCAMERA = "dcamera.hevc"
 
-# Map local filename to the key used in the /files response
-FILE_TO_SERVER_KEY = {
-    "rlog": "logs",
-    "rlog.zst": "logs",
-    "fcamera.hevc": "cameras",
-    "ecamera.hevc": "ecameras",
-    "dcamera.hevc": "dcameras",
-}
-
-RouteFiles = dict[str, list[tuple[str, str, int]]]
-
 
 def _is_recent(path: Path, cutoff: datetime) -> bool:
     """True if the path's mtime is newer than the cutoff."""
@@ -83,172 +72,67 @@ def _is_recent(path: Path, cutoff: datetime) -> bool:
     return mtime >= cutoff
 
 
-def _parse_segment_dir(name: str) -> tuple[str, int] | None:
-    """Return (route_part, segment_num) or None if the name is not a segment dir."""
+def _parse_segment_dir(name: str) -> bool:
+    """True if the directory name looks like a segment (route--N)."""
     parts = name.rsplit("--", 1)
-    if len(parts) != SEGMENT_PARTS or not parts[1].isdigit():
-        return None
-    return parts[0], int(parts[1])
+    return len(parts) == SEGMENT_PARTS and parts[1].isdigit()
 
 
-def _add_files_from_segment(
-    by_route: RouteFiles,
-    seg_dir: Path,
-    interesting: list[str],
-    route_part: str,
-    segment: int,
-) -> None:
-    for fname in interesting:
-        fpath = seg_dir / fname
-        if fpath.is_file():
-            key = f"{seg_dir.name}/{fname}"
-            by_route[route_part].append((key, str(fpath), segment))
-
-
-def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> RouteFiles:
-    """Return {route_part: [(key, path, segment), ...]}."""
-    by_route: RouteFiles = defaultdict(list)
+def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> list[tuple[str, str]]:
+    """Return list of (relative_key, absolute_path) for recent interesting files."""
     if not root.is_dir():
         print(f"Log root not found: {root}")
-        return by_route
+        return []
 
+    found: list[tuple[str, str]] = []
     for seg_dir in sorted(root.iterdir(), reverse=True):
         if not seg_dir.is_dir() or not _is_recent(seg_dir, cutoff):
             continue
-        parsed = _parse_segment_dir(seg_dir.name)
-        if parsed is None:
+        if not _parse_segment_dir(seg_dir.name):
             continue
-        route_part, segment = parsed
-        _add_files_from_segment(by_route, seg_dir, interesting, route_part, segment)
-    return by_route
+        for fname in interesting:
+            fpath = seg_dir / fname
+            if fpath.is_file():
+                found.append((f"{seg_dir.name}/{fname}", str(fpath)))
+    return found
 
 
-def _server_has_file(files_resp: dict, fname: str, segment: int) -> bool:
-    """True if the server response indicates this segment/file is already uploaded."""
-    server_key = FILE_TO_SERVER_KEY.get(fname)
-    if not server_key:
-        return False
-    urls = files_resp.get(server_key, [])
-    # Arrays are sorted by segment number; index matches segment when present
-    return isinstance(urls, list) and segment < len(urls) and bool(urls[segment])
-
-
-async def _query_route_files(api: Api, dongle_id: str, route_part: str) -> dict | None:
-    """Fetch the /files endpoint for one route. Returns the JSON or None on error."""
-    route_name = f"{dongle_id}|{route_part}"
-    endpoint = f"v1/route/{route_name}/files"
-    try:
-        resp = await asyncio.to_thread(
-            api.get,
-            endpoint,
-            timeout=20,
-            access_token=api.get_token(),
-        )
-    except Exception as e:
-        print(f"  warning: could not query {route_name}: {e}")
-        return None
-
-    if resp.status_code == HTTP_NOT_FOUND:
-        return {}
-    if resp.status_code != HTTP_OK:
-        print(f"  warning: {endpoint} returned HTTP {resp.status_code}")
-        return None
-    try:
-        return resp.json()
-    except Exception as e:
-        print(f"  warning: bad JSON from {endpoint}: {e}")
-        return None
-
-
-async def _probe_upload_url(api: Api, dongle_id: str, key: str) -> bool:
-    """Return True if the server already has this file (412)."""
+async def _probe_one(api: Api, dongle_id: str, key: str) -> bool:
+    """Return True if the server already has this file (HTTP 412)."""
     try:
         resp = await asyncio.to_thread(
             api.get,
             f"v1.4/{dongle_id}/upload_url/",
-            timeout=15,
+            timeout=PROBE_TIMEOUT,
             path=key,
             access_token=api.get_token(),
         )
     except Exception:
+        # Network error or timeout – treat as not confirmed present
         return False
     return resp.status_code == HTTP_PRECONDITION_FAILED
 
 
-async def _probe_missing(
+async def _filter_present(
     api: Api,
     dongle_id: str,
-    items: list[tuple[str, str, int]],
+    candidates: list[tuple[str, str]],
 ) -> list[tuple[str, str]]:
-    """Probe each file with the device-authenticated upload_url endpoint."""
-    sem = asyncio.Semaphore(8)
-
-    async def check(item: tuple[str, str, int]) -> tuple[str, str] | None:
-        key, path, _ = item
-        async with sem:
-            already = await _probe_upload_url(api, dongle_id, key)
-            return None if already else (key, path)
-
-    results = await asyncio.gather(*(check(it) for it in items))
-    return [r for r in results if r is not None]
-
-
-def _missing_for_route(
-    files_resp: dict,
-    items: list[tuple[str, str, int]],
-) -> list[tuple[str, str]]:
-    missing = []
-    for key, path, segment in items:
-        fname = key.rsplit("/", 1)[-1]
-        if not _server_has_file(files_resp, fname, segment):
-            missing.append((key, path))
-    return missing
-
-
-def _classify_results(
-    by_route: RouteFiles,
-    results: list[tuple[str, dict | None]],
-) -> tuple[list[tuple[str, str]], list[tuple[str, str, int]]]:
-    """Split query results into already-known missing files and items that need probing."""
-    missing: list[tuple[str, str]] = []
-    need_probe: list[tuple[str, str, int]] = []
-    for route_part, files_resp in results:
-        items = by_route[route_part]
-        if files_resp is None:
-            print(f"  falling back to per-file probe for route {route_part}")
-            need_probe.extend(items)
-        else:
-            missing.extend(_missing_for_route(files_resp, items))
-    return missing, need_probe
-
-
-async def _filter_by_server(
-    api: Api,
-    dongle_id: str,
-    by_route: RouteFiles,
-) -> list[tuple[str, str]]:
-    """Query each route; fall back to per-file upload_url probes when needed."""
-    if not by_route:
+    """Keep only files the server does not already have."""
+    if not candidates:
         return []
 
-    sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
 
-    async def bounded_query(route_part: str) -> tuple[str, dict | None]:
+    async def check(item: tuple[str, str]) -> tuple[str, str] | None:
+        key, path = item
         async with sem:
-            result = await _query_route_files(api, dongle_id, route_part)
-            await asyncio.sleep(0.2)
-            return route_part, result
+            already = await _probe_one(api, dongle_id, key)
+            return None if already else (key, path)
 
-    tasks = [bounded_query(rp) for rp in by_route]
-    results = await asyncio.gather(*tasks)
-
-    missing, need_probe = _classify_results(by_route, results)
-
-    if need_probe:
-        print(f"  probing {len(need_probe)} file(s) via upload_url...")
-        missing.extend(await _probe_missing(api, dongle_id, need_probe))
-
-    return missing
+    print(f"Probing {len(candidates)} file(s) with the server...")
+    results = await asyncio.gather(*(check(it) for it in candidates))
+    return [r for r in results if r is not None]
 
 
 def find_unuploaded(
@@ -264,12 +148,11 @@ def find_unuploaded(
     if include_dcamera:
         interesting.append(DCAMERA)
 
-    by_route = _collect_local(root, interesting, cutoff)
-    if not by_route:
+    candidates = _collect_local(root, interesting, cutoff)
+    if not candidates:
         return []
 
-    print(f"Querying server for {len(by_route)} route(s)...")
-    return asyncio.run(_filter_by_server(api, dongle_id, by_route))
+    return asyncio.run(_filter_present(api, dongle_id, candidates))
 
 
 def _mark_uploaded(fn: str) -> None:
@@ -397,4 +280,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(130)
