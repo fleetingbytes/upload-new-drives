@@ -138,7 +138,6 @@ async def _query_route_files(api: Api, dongle_id: str, route_part: str) -> dict 
     route_name = f"{dongle_id}|{route_part}"
     endpoint = f"v1/route/{route_name}/files"
     try:
-        # Run the blocking request in a thread so we can gather many of them
         resp = await asyncio.to_thread(
             api.get,
             endpoint,
@@ -161,6 +160,39 @@ async def _query_route_files(api: Api, dongle_id: str, route_part: str) -> dict 
         return None
 
 
+async def _probe_upload_url(api: Api, dongle_id: str, key: str) -> bool:
+    """Return True if the server already has this file (412)."""
+    try:
+        resp = await asyncio.to_thread(
+            api.get,
+            f"v1.4/{dongle_id}/upload_url/",
+            timeout=15,
+            path=key,
+            access_token=api.get_token(),
+        )
+    except Exception:
+        return False
+    return resp.status_code == HTTP_PRECONDITION_FAILED
+
+
+async def _probe_missing(
+    api: Api,
+    dongle_id: str,
+    items: list[tuple[str, str, int]],
+) -> list[tuple[str, str]]:
+    """Probe each file with the device-authenticated upload_url endpoint."""
+    sem = asyncio.Semaphore(8)
+
+    async def check(item: tuple[str, str, int]) -> tuple[str, str] | None:
+        key, path, _ = item
+        async with sem:
+            already = await _probe_upload_url(api, dongle_id, key)
+            return None if already else (key, path)
+
+    results = await asyncio.gather(*(check(it) for it in items))
+    return [r for r in results if r is not None]
+
+
 def _missing_for_route(
     files_resp: dict,
     items: list[tuple[str, str, int]],
@@ -178,29 +210,36 @@ async def _filter_by_server(
     dongle_id: str,
     by_route: RouteFiles,
 ) -> list[tuple[str, str]]:
-    """Concurrently query each route and keep only files the server does not have."""
+    """Query each route; fall back to per-file upload_url probes when needed."""
     if not by_route:
         return []
 
-    # Limit concurrency so we stay well under the 5/min rate limit on /files
     sem = asyncio.Semaphore(3)
 
     async def bounded_query(route_part: str) -> tuple[str, dict | None]:
         async with sem:
             result = await _query_route_files(api, dongle_id, route_part)
-            await asyncio.sleep(0.2)  # small stagger
+            await asyncio.sleep(0.2)
             return route_part, result
 
     tasks = [bounded_query(rp) for rp in by_route]
     results = await asyncio.gather(*tasks)
 
     missing: list[tuple[str, str]] = []
+    need_probe: list[tuple[str, str, int]] = []
+
     for route_part, files_resp in results:
+        items = by_route[route_part]
         if files_resp is None:
-            # Could not determine status - skip rather than risk re-uploading everything
-            print(f"  skipping route {route_part} (server query failed)")
+            print(f"  falling back to per-file probe for route {route_part}")
+            need_probe.extend(items)
             continue
-        missing.extend(_missing_for_route(files_resp, by_route[route_part]))
+        missing.extend(_missing_for_route(files_resp, items))
+
+    if need_probe:
+        print(f"  probing {len(need_probe)} file(s) via upload_url...")
+        missing.extend(await _probe_missing(api, dongle_id, need_probe))
+
     return missing
 
 
