@@ -6,12 +6,13 @@ Run this on the device (via SSH) while it is connected to Wi-Fi.
 Requires the openpilot Python environment (PYTHONPATH=/data/openpilot or run from the openpilot venv).
 
 Usage:
-    python3 upload-new-drives.py [--days 7] [--dry-run] [--include-dcamera]
+    python3 upload-new-drives.py [--days 7] [--dry-run] [--include-dcamera] [--verbose]
 """
 
 import argparse
 import asyncio
 import contextlib
+import logging
 import os
 import sys
 import time
@@ -51,6 +52,10 @@ SUCCESS_CODES = {HTTP_OK, HTTP_CREATED}
 SEGMENT_PARTS = 2
 PROBE_TIMEOUT = 10
 PROBE_CONCURRENCY = 6
+PROGRESS_EVERY = 50
+
+LOG_DIR = Path.home() / ".local" / "state" / "upload-new-drives"
+LOG_FILE = LOG_DIR / "debug.log"
 
 # Files we care about for a "full" upload (qlogs/qcameras are usually already uploaded)
 DEFAULT_FILES = (
@@ -61,6 +66,30 @@ DEFAULT_FILES = (
 )
 
 DCAMERA = "dcamera.hevc"
+
+log = logging.getLogger("upload-new-drives")
+
+
+def _setup_logging(verbose: bool) -> None:
+    """Always log verbosely to a file; optionally also to stderr."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log.setLevel(logging.DEBUG)
+    log.handlers.clear()
+
+    file_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(file_fmt)
+    log.addHandler(fh)
+
+    if verbose:
+        console_fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
+        ch = logging.StreamHandler(sys.stderr)
+        ch.setLevel(logging.DEBUG)
+        ch.setFormatter(console_fmt)
+        log.addHandler(ch)
+
+    log.debug("logging started (file=%s, verbose=%s)", LOG_FILE, verbose)
 
 
 def _is_recent(path: Path, cutoff: datetime) -> bool:
@@ -78,10 +107,19 @@ def _parse_segment_dir(name: str) -> bool:
     return len(parts) == SEGMENT_PARTS and parts[1].isdigit()
 
 
+def _files_in_segment(seg_dir: Path, interesting: list[str]) -> list[tuple[str, str]]:
+    found = []
+    for fname in interesting:
+        fpath = seg_dir / fname
+        if fpath.is_file():
+            found.append((f"{seg_dir.name}/{fname}", str(fpath)))
+    return found
+
+
 def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> list[tuple[str, str]]:
     """Return list of (relative_key, absolute_path) for recent interesting files."""
     if not root.is_dir():
-        print(f"Log root not found: {root}")
+        log.warning("Log root not found: %s", root)
         return []
 
     found: list[tuple[str, str]] = []
@@ -90,15 +128,14 @@ def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> list
             continue
         if not _parse_segment_dir(seg_dir.name):
             continue
-        for fname in interesting:
-            fpath = seg_dir / fname
-            if fpath.is_file():
-                found.append((f"{seg_dir.name}/{fname}", str(fpath)))
+        found.extend(_files_in_segment(seg_dir, interesting))
+    log.debug("collected %d local candidate file(s)", len(found))
     return found
 
 
 async def _probe_one(api: Api, dongle_id: str, key: str) -> bool:
     """Return True if the server already has this file (HTTP 412)."""
+    t0 = time.monotonic()
     try:
         resp = await asyncio.to_thread(
             api.get,
@@ -107,10 +144,32 @@ async def _probe_one(api: Api, dongle_id: str, key: str) -> bool:
             path=key,
             access_token=api.get_token(),
         )
-    except Exception:
-        # Network error or timeout – treat as not confirmed present
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        log.debug("probe error %s (%.1fs): %s", key, elapsed, e)
         return False
-    return resp.status_code == HTTP_PRECONDITION_FAILED
+    elapsed = time.monotonic() - t0
+    already = resp.status_code == HTTP_PRECONDITION_FAILED
+    log.debug("probe %s -> %s (%.1fs)", key, resp.status_code, elapsed)
+    return already
+
+
+async def _check_one(
+    sem: asyncio.Semaphore,
+    api: Api,
+    dongle_id: str,
+    item: tuple[str, str],
+    progress: dict[str, int],
+) -> tuple[str, str] | None:
+    key, path = item
+    async with sem:
+        already = await _probe_one(api, dongle_id, key)
+        progress["done"] += 1
+        done = progress["done"]
+        total = progress["total"]
+        if done % PROGRESS_EVERY == 0 or done == total:
+            log.info("progress: %d/%d probed", done, total)
+        return None if already else (key, path)
 
 
 async def _filter_present(
@@ -122,17 +181,15 @@ async def _filter_present(
     if not candidates:
         return []
 
+    log.info("probing %d file(s) with the server (concurrency=%d)", len(candidates), PROBE_CONCURRENCY)
     sem = asyncio.Semaphore(PROBE_CONCURRENCY)
+    progress = {"done": 0, "total": len(candidates)}
 
-    async def check(item: tuple[str, str]) -> tuple[str, str] | None:
-        key, path = item
-        async with sem:
-            already = await _probe_one(api, dongle_id, key)
-            return None if already else (key, path)
-
-    print(f"Probing {len(candidates)} file(s) with the server...")
-    results = await asyncio.gather(*(check(it) for it in candidates))
-    return [r for r in results if r is not None]
+    tasks = [_check_one(sem, api, dongle_id, it, progress) for it in candidates]
+    results = await asyncio.gather(*tasks)
+    missing = [r for r in results if r is not None]
+    log.info("probe finished: %d missing out of %d", len(missing), len(candidates))
+    return missing
 
 
 def find_unuploaded(
@@ -161,7 +218,7 @@ def _mark_uploaded(fn: str) -> None:
 
 
 def _handle_412(fn: str) -> bool:
-    print("    skipped (412 - already exists or ignored)")
+    log.info("skipped 412: %s", fn)
     _mark_uploaded(fn)
     return True
 
@@ -175,20 +232,20 @@ def _put_file(url: str, headers: dict, fn: str, key: str) -> bool:
 
     if resp.status_code in SUCCESS_CODES:
         _mark_uploaded(fn)
-        print(f"    success ({size / 1e6:.1f} MB)")
+        log.info("uploaded %s (%.1f MB)", key, size / 1e6)
         return True
 
-    print(f"    upload failed: HTTP {resp.status_code}")
+    log.warning("upload failed %s: HTTP %s", key, resp.status_code)
     return False
 
 
 def upload_file(api: Api, dongle_id: str, key: str, fn: str, dry_run: bool) -> bool:
     """Request upload URL and PUT the file. Returns True on success."""
     if dry_run:
-        print(f"  [dry-run] would upload {key}")
+        log.info("[dry-run] would upload %s", key)
         return True
 
-    print(f"  Uploading {key} ...")
+    log.info("uploading %s", key)
     try:
         url_resp = api.get(
             f"v1.4/{dongle_id}/upload_url/",
@@ -197,14 +254,14 @@ def upload_file(api: Api, dongle_id: str, key: str, fn: str, dry_run: bool) -> b
             access_token=api.get_token(),
         )
     except Exception as e:
-        print(f"    error: {e}")
+        log.exception("error getting upload URL for %s: %s", key, e)
         return False
 
     if url_resp.status_code == HTTP_PRECONDITION_FAILED:
         return _handle_412(fn)
 
     if url_resp.status_code != HTTP_OK:
-        print(f"    failed to get URL: HTTP {url_resp.status_code}")
+        log.warning("failed to get URL for %s: HTTP %s", key, url_resp.status_code)
         return False
 
     data = url_resp.json()
@@ -220,6 +277,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-dcamera", action="store_true", help="Also upload dcamera.hevc if present"
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Also log progress to stderr"
+    )
     return parser.parse_args()
 
 
@@ -227,20 +287,20 @@ def _get_dongle_id() -> str:
     params = Params()
     raw = params.get("DongleId")
     if raw is None:
-        print("Error: Device not registered (no DongleId)")
+        log.error("Device not registered (no DongleId)")
         sys.exit(1)
     # Newer openpilot returns str; older versions may return bytes
     dongle_id = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
     if not dongle_id or dongle_id == "UnregisteredDevice":
-        print("Error: Device not registered (no DongleId)")
+        log.error("Device not registered (no DongleId)")
         sys.exit(1)
     return dongle_id
 
 
 def _print_files(files: list[tuple[str, str]]) -> None:
-    print(f"Found {len(files)} file(s) to upload:")
+    log.info("found %d file(s) to upload", len(files))
     for key, _ in files:
-        print(f"  {key}")
+        log.info("  %s", key)
 
 
 def _do_uploads(api: Api, dongle_id: str, files: list[tuple[str, str]], dry_run: bool) -> int:
@@ -255,33 +315,34 @@ def _do_uploads(api: Api, dongle_id: str, files: list[tuple[str, str]], dry_run:
 
 def main() -> None:
     args = _parse_args()
+    _setup_logging(args.verbose)
+
     dongle_id = _get_dongle_id()
     root = Path(Paths.log_root())
 
-    print(f"Dongle ID: {dongle_id}")
-    print(f"Log root:  {root}")
-    print(f"Scanning last {args.days} days...")
+    log.info("Dongle ID: %s", dongle_id)
+    log.info("Log root:  %s", root)
+    log.info("Scanning last %d days...", args.days)
 
     api = Api(dongle_id)
     files = find_unuploaded(api, dongle_id, root, args.days, args.include_dcamera)
     if not files:
-        print("No unuploaded files found.")
+        log.info("No unuploaded files found.")
         return
 
     _print_files(files)
-    print()
 
     success = _do_uploads(api, dongle_id, files, args.dry_run)
 
     if args.dry_run:
-        print(f"\nDry run - nothing uploaded ({success}/{len(files)} files).")
+        log.info("Dry run - nothing uploaded (%d/%d files).", success, len(files))
     else:
-        print(f"\nDone. {success}/{len(files)} uploaded successfully.")
+        log.info("Done. %d/%d uploaded successfully.", success, len(files))
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nInterrupted.")
+        log.info("Interrupted.")
         sys.exit(130)
