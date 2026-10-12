@@ -205,6 +205,23 @@ def _missing_for_route(
     return missing
 
 
+def _classify_results(
+    by_route: RouteFiles,
+    results: list[tuple[str, dict | None]],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, int]]]:
+    """Split query results into already-known missing files and items that need probing."""
+    missing: list[tuple[str, str]] = []
+    need_probe: list[tuple[str, str, int]] = []
+    for route_part, files_resp in results:
+        items = by_route[route_part]
+        if files_resp is None:
+            print(f"  falling back to per-file probe for route {route_part}")
+            need_probe.extend(items)
+        else:
+            missing.extend(_missing_for_route(files_resp, items))
+    return missing, need_probe
+
+
 async def _filter_by_server(
     api: Api,
     dongle_id: str,
@@ -225,16 +242,7 @@ async def _filter_by_server(
     tasks = [bounded_query(rp) for rp in by_route]
     results = await asyncio.gather(*tasks)
 
-    missing: list[tuple[str, str]] = []
-    need_probe: list[tuple[str, str, int]] = []
-
-    for route_part, files_resp in results:
-        items = by_route[route_part]
-        if files_resp is None:
-            print(f"  falling back to per-file probe for route {route_part}")
-            need_probe.extend(items)
-            continue
-        missing.extend(_missing_for_route(files_resp, items))
+    missing, need_probe = _classify_results(by_route, results)
 
     if need_probe:
         print(f"  probing {len(need_probe)} file(s) via upload_url...")
