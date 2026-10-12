@@ -50,6 +50,8 @@ HTTP_PRECONDITION_FAILED = 412
 HTTP_NOT_FOUND = 404
 SUCCESS_CODES = {HTTP_OK, HTTP_CREATED}
 
+SEGMENT_PARTS = 2
+
 # Files we care about for a "full" upload (qlogs/qcameras are usually already uploaded)
 DEFAULT_FILES = (
     "rlog",
@@ -69,6 +71,8 @@ FILE_TO_SERVER_KEY = {
     "dcamera.hevc": "dcameras",
 }
 
+RouteFiles = dict[str, list[tuple[str, str, int]]]
+
 
 def _is_recent(path: Path, cutoff: datetime) -> bool:
     """True if the path's mtime is newer than the cutoff."""
@@ -82,14 +86,28 @@ def _is_recent(path: Path, cutoff: datetime) -> bool:
 def _parse_segment_dir(name: str) -> tuple[str, int] | None:
     """Return (route_part, segment_num) or None if the name is not a segment dir."""
     parts = name.rsplit("--", 1)
-    if len(parts) != 2 or not parts[1].isdigit():
+    if len(parts) != SEGMENT_PARTS or not parts[1].isdigit():
         return None
     return parts[0], int(parts[1])
 
 
-def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> dict[str, list[tuple[str, str, int]]]:
+def _add_files_from_segment(
+    by_route: RouteFiles,
+    seg_dir: Path,
+    interesting: list[str],
+    route_part: str,
+    segment: int,
+) -> None:
+    for fname in interesting:
+        fpath = seg_dir / fname
+        if fpath.is_file():
+            key = f"{seg_dir.name}/{fname}"
+            by_route[route_part].append((key, str(fpath), segment))
+
+
+def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> RouteFiles:
     """Return {route_part: [(key, path, segment), ...]}."""
-    by_route: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+    by_route: RouteFiles = defaultdict(list)
     if not root.is_dir():
         print(f"Log root not found: {root}")
         return by_route
@@ -101,11 +119,7 @@ def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> dict
         if parsed is None:
             continue
         route_part, segment = parsed
-        for fname in interesting:
-            fpath = seg_dir / fname
-            if fpath.is_file():
-                key = f"{seg_dir.name}/{fname}"
-                by_route[route_part].append((key, str(fpath), segment))
+        _add_files_from_segment(by_route, seg_dir, interesting, route_part, segment)
     return by_route
 
 
@@ -147,10 +161,22 @@ async def _query_route_files(api: Api, dongle_id: str, route_part: str) -> dict 
         return None
 
 
+def _missing_for_route(
+    files_resp: dict,
+    items: list[tuple[str, str, int]],
+) -> list[tuple[str, str]]:
+    missing = []
+    for key, path, segment in items:
+        fname = key.rsplit("/", 1)[-1]
+        if not _server_has_file(files_resp, fname, segment):
+            missing.append((key, path))
+    return missing
+
+
 async def _filter_by_server(
     api: Api,
     dongle_id: str,
-    by_route: dict[str, list[tuple[str, str, int]]],
+    by_route: RouteFiles,
 ) -> list[tuple[str, str]]:
     """Concurrently query each route and keep only files the server does not have."""
     if not by_route:
@@ -171,13 +197,10 @@ async def _filter_by_server(
     missing: list[tuple[str, str]] = []
     for route_part, files_resp in results:
         if files_resp is None:
-            # Could not determine status – skip rather than risk re-uploading everything
+            # Could not determine status - skip rather than risk re-uploading everything
             print(f"  skipping route {route_part} (server query failed)")
             continue
-        for key, path, segment in by_route[route_part]:
-            fname = key.rsplit("/", 1)[-1]
-            if not _server_has_file(files_resp, fname, segment):
-                missing.append((key, path))
+        missing.extend(_missing_for_route(files_resp, by_route[route_part]))
     return missing
 
 
