@@ -83,6 +83,12 @@ def _scan_route(route_dir: Path, interesting: list[str]) -> list[tuple[str, str]
     return results
 
 
+def _should_scan_route(route_dir: Path, cutoff: datetime) -> bool:
+    if not route_dir.is_dir() or not route_dir.name[0].isdigit():
+        return False
+    return _route_is_recent(route_dir.name, cutoff)
+
+
 def find_unuploaded(root: Path, max_days: int, include_dcamera: bool) -> list[tuple[str, str]]:
     """Return list of (relative_key, absolute_path) for files that need uploading."""
     if not root.is_dir():
@@ -96,9 +102,7 @@ def find_unuploaded(root: Path, max_days: int, include_dcamera: bool) -> list[tu
 
     results: list[tuple[str, str]] = []
     for route_dir in sorted(root.iterdir(), reverse=True):
-        if not route_dir.is_dir() or not route_dir.name[0].isdigit():
-            continue
-        if not _route_is_recent(route_dir.name, cutoff):
+        if not _should_scan_route(route_dir, cutoff):
             continue
         results.extend(_scan_route(route_dir, interesting))
 
@@ -163,9 +167,13 @@ def upload_file(api: Api, dongle_id: str, key: str, fn: str, dry_run: bool) -> b
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Upload recent unuploaded openpilot drives")
-    parser.add_argument("--days", type=int, default=14, help="How many recent days to scan (default: 14)")
+    parser.add_argument(
+        "--days", type=int, default=14, help="How many recent days to scan (default: 14)"
+    )
     parser.add_argument("--dry-run", action="store_true", help="List files but do not upload")
-    parser.add_argument("--include-dcamera", action="store_true", help="Also upload dcamera.hevc if present")
+    parser.add_argument(
+        "--include-dcamera", action="store_true", help="Also upload dcamera.hevc if present"
+    )
     return parser.parse_args()
 
 
