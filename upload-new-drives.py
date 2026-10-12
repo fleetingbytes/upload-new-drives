@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,14 +21,22 @@ try:
     from openpilot.common.api import Api
     from openpilot.common.params import Params
     from openpilot.common.utils import get_upload_stream
-    from openpilot.system.hardware.hw import Paths
+    from openpilot.common.hardware.hw import Paths
     from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
-except ImportError:
+except ImportError as e:
     print("Error: Could not import openpilot modules.")
-    print("Run this script on the Comma device with PYTHONPATH=/data/openpilot")
-    print("    e.g. PYTHONPATH=/data/openpilot python3 upload-new-drives.py")
+    print(f"Import error: {e}")
+    print()
+    print("This script must be run on the Comma device where openpilot is installed.")
+    print("Current PYTHONPATH:", os.environ.get("PYTHONPATH", "(not set)"))
+    print()
+    print("Typical fix:")
+    print("  PYTHONPATH=/data/openpilot python3 upload-new-drives.py")
+    print()
+    traceback.print_exc()
     sys.exit(1)
 
+import os
 import requests
 
 UPLOAD_ATTR_NAME = "user.upload"
