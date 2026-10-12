@@ -188,7 +188,12 @@ def _parse_args() -> argparse.Namespace:
 
 def _get_dongle_id() -> str:
     params = Params()
-    dongle_id = params.get("DongleId", encoding="utf-8")
+    raw = params.get("DongleId")
+    if raw is None:
+        print("Error: Device not registered (no DongleId)")
+        sys.exit(1)
+    # Newer openpilot returns str; older versions may return bytes
+    dongle_id = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
     if not dongle_id or dongle_id == "UnregisteredDevice":
         print("Error: Device not registered (no DongleId)")
         sys.exit(1)
