@@ -36,15 +36,16 @@ PYTHONPATH=/data/openpilot python3 upload-new-drives.py --include-dcamera
 
 ## How it works
 
-1. Scans `/data/media/0/realdata/` for recent routes/segments.
-2. Groups candidate files by route and queries the comma API once per route via `GET /v1/route/{dongle}|{route}/files` (the same endpoint the Connect web UI uses for the Files panel). This returns the already-uploaded files for the entire route in a single call.
-3. Only files missing from the server response are queued for upload.
-4. For each missing file, requests a signed upload URL via the device's own API credentials and PUTs the file.
-5. On success, sets the `user.upload` extended attribute so the file is not retried on future runs.
+1. Scans `/data/media/0/realdata/` for recent segments.
+2. Skips any file that already has the `user.upload` extended attribute set (local fast path).
+3. For the remaining files, probes the server with `GET /v1.4/{dongle}/upload_url/?path=...` (the same endpoint the official uploader uses). HTTP 412 means the file is already present; the script marks the xattr and skips it.
+4. Probes run with low concurrency (2) and automatic retries + exponential backoff on timeouts and 503s so they stay polite to the server.
+5. Missing files are uploaded via a signed URL and PUT. On success the `user.upload` attribute is set.
 
-The route-level query is rate-limited by the server to 5 calls per minute, so the script spaces requests accordingly. This is dramatically faster and more reliable than the previous per-file probing of `/v1.4/.../upload_url`.
+Note: the Connect web UI’s route `/files` endpoint requires a user JWT, not the device JWT, so it cannot be used from the device itself. The upload_url 412 check is the device-compatible equivalent.
 
 ## Notes
 
 - Large files (especially camera videos) can take a long time. Leave the device on Wi-Fi and charging.
-- You can safely re-run it; already-uploaded files are skipped.
+- You can safely re-run it; already-uploaded files (local xattr or server 412) are skipped.
+- The first run on a large backlog may take a few minutes for the probe phase; subsequent runs are much faster thanks to the xattr.
