@@ -1,3 +1,7 @@
+# Archived
+
+Legacy project for automatically uploading recent drive logs from a Comma 3X device. New project is upcoming.
+
 # upload-new-drives
 
 Upload recent driving sessions from a Comma 3X (or other openpilot device) that have not yet been fully uploaded to comma Connect.
