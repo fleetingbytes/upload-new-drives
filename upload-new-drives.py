@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import asyncio
 import contextlib
 import logging
 import os
@@ -19,6 +18,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 
 try:
     from openpilot.common.api import Api
@@ -50,16 +50,16 @@ HTTP_PRECONDITION_FAILED = 412
 SUCCESS_CODES = {HTTP_OK, HTTP_CREATED}
 
 SEGMENT_PARTS = 2
-PROBE_TIMEOUT = 20
-PROBE_CONCURRENCY = 2
-PROBE_RETRIES = 3
-PROBE_BACKOFF = 2.0  # seconds, exponential
-PROGRESS_EVERY = 50
+PROBE_TIMEOUT = 30
+BATCH_SIZE = 40
+BATCH_INTERVAL = 3.0  # seconds between batch calls
+SINGLE_INTERVAL = 1.0  # seconds between single probes
+PROBE_RETRIES = 4
+PROBE_BACKOFF = 5.0  # base seconds, exponential
 
 LOG_DIR = Path.home() / ".local" / "state" / "upload-new-drives"
 LOG_FILE = LOG_DIR / "debug.log"
 
-# Files we care about for a "full" upload (qlogs/qcameras are usually already uploaded)
 DEFAULT_FILES = (
     "rlog",
     "rlog.zst",
@@ -73,12 +73,11 @@ log = logging.getLogger("upload-new-drives")
 
 
 def _setup_logging(verbose: bool) -> None:
-    """Always log verbosely to a file; optionally also to stderr."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log.setLevel(logging.DEBUG)
     log.handlers.clear()
 
-    file_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_fmt = logging.Formatter("% (asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(file_fmt)
@@ -95,7 +94,6 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def _is_recent(path: Path, cutoff: datetime) -> bool:
-    """True if the path's mtime is newer than the cutoff."""
     try:
         mtime = datetime.fromtimestamp(path.stat().st_mtime)
     except OSError:
@@ -104,13 +102,11 @@ def _is_recent(path: Path, cutoff: datetime) -> bool:
 
 
 def _parse_segment_dir(name: str) -> bool:
-    """True if the directory name looks like a segment (route--N)."""
     parts = name.rsplit("--", 1)
     return len(parts) == SEGMENT_PARTS and parts[1].isdigit()
 
 
 def _has_upload_xattr(path: str) -> bool:
-    """True if the file is already marked as uploaded via xattr."""
     try:
         return getxattr(path, UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE
     except OSError:
@@ -127,7 +123,6 @@ def _files_in_segment(seg_dir: Path, interesting: list[str]) -> list[tuple[str, 
 
 
 def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> list[tuple[str, str]]:
-    """Return list of (relative_key, absolute_path) for recent interesting files that are not locally marked uploaded."""
     if not root.is_dir():
         log.warning("Log root not found: %s", root)
         return []
@@ -152,17 +147,98 @@ def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> list
     return found
 
 
-async def _probe_one(api: Api, dongle_id: str, key: str) -> bool:
-    """Return True if the server already has this file (HTTP 412).
+def _path_from_url(url: str) -> str | None:
+    """Best-effort extract of the original relative path from a signed URL."""
+    try:
+        decoded = unquote(url)
+        # typical: .../dongle/route--N/filename?...
+        parts = decoded.split("/")
+        for i, p in enumerate(parts):
+            if "--" in p and i + 1 < len(parts):
+                return f"{p}/{parts[i + 1].split('?')[0]}"
+    except (ValueError, IndexError, TypeError):
+        pass
+    return None
 
-    Retries on timeout / 503 with exponential backoff.
-    """
+
+def _batch_probe(
+    api: Api, dongle_id: str, items: list[tuple[str, str]]
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]] | None:
+    """Try one batch call. Returns (missing, already) or None on failure."""
+    paths = [k for k, _ in items]
+
     delay = PROBE_BACKOFF
     for attempt in range(PROBE_RETRIES):
         t0 = time.monotonic()
         try:
-            resp = await asyncio.to_thread(
-                api.get,
+            resp = api.post(
+                f"v1/{dongle_id}/upload_urls/",
+                json={"paths": paths, "expiry_days": 1},
+                timeout=PROBE_TIMEOUT,
+                access_token=api.get_token(),
+            )
+        except requests.RequestException as e:
+            elapsed = time.monotonic() - t0
+            log.debug("batch error attempt %d (%.1fs): %s", attempt + 1, elapsed, e)
+            if attempt + 1 < PROBE_RETRIES:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return None
+
+        elapsed = time.monotonic() - t0
+        if resp.status_code != HTTP_OK:
+            log.debug("batch -> HTTP %s attempt %d (%.1fs)", resp.status_code, attempt + 1, elapsed)
+            if resp.status_code in (503, 429) and attempt + 1 < PROBE_RETRIES:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return None
+
+        try:
+            data = resp.json()
+        except (ValueError, requests.JSONDecodeError) as e:
+            log.debug("batch bad JSON: %s", e)
+            return None
+
+        if not isinstance(data, list):
+            log.debug("batch unexpected response type")
+            return None
+
+        returned_paths = set()
+        for item in data:
+            if isinstance(item, dict) and "url" in item:
+                p = _path_from_url(item["url"])
+                if p:
+                    returned_paths.add(p)
+
+        missing = []
+        already = []
+        for key, path in items:
+            if key in returned_paths:
+                missing.append((key, path))
+            else:
+                already.append((key, path))
+
+        log.debug(
+            "batch of %d: %d need upload, %d already present (%.1fs)",
+            len(items),
+            len(missing),
+            len(already),
+            elapsed,
+        )
+        return missing, already
+
+    return None
+
+
+def _single_probe(api: Api, dongle_id: str, key: str) -> bool:
+    """Return True if already uploaded (412)."""
+    delay = PROBE_BACKOFF
+    for attempt in range(PROBE_RETRIES):
+        t0 = time.monotonic()
+        try:
+            resp = api.get(
                 f"v1.4/{dongle_id}/upload_url/",
                 timeout=PROBE_TIMEOUT,
                 path=key,
@@ -170,78 +246,74 @@ async def _probe_one(api: Api, dongle_id: str, key: str) -> bool:
             )
         except requests.RequestException as e:
             elapsed = time.monotonic() - t0
-            log.debug("probe error %s attempt %d (%.1fs): %s", key, attempt + 1, elapsed, e)
+            log.debug("single probe error %s attempt %d (%.1fs): %s", key, attempt + 1, elapsed, e)
             if attempt + 1 < PROBE_RETRIES:
-                await asyncio.sleep(delay)
+                time.sleep(delay)
                 delay *= 2
                 continue
-            return False  # give up, treat as missing
+            return False
 
         elapsed = time.monotonic() - t0
         if resp.status_code == HTTP_PRECONDITION_FAILED:
-            log.debug("probe %s -> 412 (already uploaded, %.1fs)", key, elapsed)
+            log.debug("single probe %s -> 412 (%.1fs)", key, elapsed)
             return True
-        if resp.status_code in (HTTP_OK, 503, 429):
-            # 200 = needs upload; 503/429 = temporary, retry
-            if resp.status_code == HTTP_OK:
-                log.debug("probe %s -> %s (needs upload, %.1fs)", key, resp.status_code, elapsed)
-                return False
-            log.debug("probe %s -> %s attempt %d (%.1fs), retrying", key, resp.status_code, attempt + 1, elapsed)
-            if attempt + 1 < PROBE_RETRIES:
-                await asyncio.sleep(delay)
-                delay *= 2
-                continue
-            return False  # treat as missing after retries
-        # other status: log and treat as missing
-        log.debug("probe %s -> %s (%.1fs)", key, resp.status_code, elapsed)
+        if resp.status_code == HTTP_OK:
+            log.debug("single probe %s -> 200 (%.1fs)", key, elapsed)
+            return False
+        if resp.status_code in (503, 429) and attempt + 1 < PROBE_RETRIES:
+            log.debug(
+                "single probe %s -> %s attempt %d (%.1fs), retrying",
+                key,
+                resp.status_code,
+                attempt + 1,
+                elapsed,
+            )
+            time.sleep(delay)
+            delay *= 2
+            continue
+        log.debug("single probe %s -> %s (%.1fs)", key, resp.status_code, elapsed)
         return False
     return False
 
 
-async def _check_one(
-    sem: asyncio.Semaphore,
-    api: Api,
-    dongle_id: str,
-    item: tuple[str, str],
-    progress: dict[str, int],
-) -> tuple[str, str] | None:
-    key, path = item
-    async with sem:
-        already = await _probe_one(api, dongle_id, key)
-        if already:
-            _mark_uploaded(path)
-        progress["done"] += 1
-        done = progress["done"]
-        total = progress["total"]
-        if done % PROGRESS_EVERY == 0 or done == total:
-            log.info("progress: %d/%d probed", done, total)
-        return None if already else (key, path)
-
-
-async def _filter_present(
-    api: Api,
-    dongle_id: str,
-    candidates: list[tuple[str, str]],
-) -> list[tuple[str, str]]:
-    """Keep only files the server does not already have.
-
-    Uses the device-auth upload_url endpoint (412 = already present).
-    """
+def _filter_present(api: Api, dongle_id: str, candidates: list[tuple[str, str]]) -> list[tuple[str, str]]:
     if not candidates:
         return []
 
-    log.info(
-        "probing %d file(s) with upload_url (concurrency=%d, retries=%d)",
-        len(candidates),
-        PROBE_CONCURRENCY,
-        PROBE_RETRIES,
-    )
-    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
-    progress = {"done": 0, "total": len(candidates)}
+    log.info("probing %d file(s) via batch upload_urls (batch_size=%d)", len(candidates), BATCH_SIZE)
+    missing: list[tuple[str, str]] = []
+    already_count = 0
 
-    tasks = [_check_one(sem, api, dongle_id, it, progress) for it in candidates]
-    results = await asyncio.gather(*tasks)
-    missing = [r for r in results if r is not None]
+    for i in range(0, len(candidates), BATCH_SIZE):
+        chunk = candidates[i : i + BATCH_SIZE]
+        if i > 0:
+            time.sleep(BATCH_INTERVAL)
+
+        result = _batch_probe(api, dongle_id, chunk)
+        if result is None:
+            log.warning("batch failed for %d files, falling back to single probes", len(chunk))
+            for key, path in chunk:
+                time.sleep(SINGLE_INTERVAL)
+                if _single_probe(api, dongle_id, key):
+                    _mark_uploaded(path)
+                    already_count += 1
+                else:
+                    missing.append((key, path))
+        else:
+            chunk_missing, chunk_already = result
+            missing.extend(chunk_missing)
+            for _, path in chunk_already:
+                _mark_uploaded(path)
+                already_count += 1
+
+        log.info(
+            "progress: %d/%d checked (%d already, %d missing so far)",
+            min(i + BATCH_SIZE, len(candidates)),
+            len(candidates),
+            already_count,
+            len(missing),
+        )
+
     log.info("probe finished: %d missing out of %d", len(missing), len(candidates))
     return missing
 
@@ -253,7 +325,6 @@ def find_unuploaded(
     max_days: int,
     include_dcamera: bool,
 ) -> list[tuple[str, str]]:
-    """Return list of (relative_key, absolute_path) that the server does not yet have."""
     cutoff = datetime.now() - timedelta(days=max_days)
     interesting = list(DEFAULT_FILES)
     if include_dcamera:
@@ -263,7 +334,7 @@ def find_unuploaded(
     if not candidates:
         return []
 
-    return asyncio.run(_filter_present(api, dongle_id, candidates))
+    return _filter_present(api, dongle_id, candidates)
 
 
 def _mark_uploaded(fn: str) -> None:
@@ -294,7 +365,6 @@ def _put_file(url: str, headers: dict, fn: str, key: str) -> bool:
 
 
 def upload_file(api: Api, dongle_id: str, key: str, fn: str, dry_run: bool) -> bool:
-    """Request upload URL and PUT the file. Returns True on success."""
     if dry_run:
         log.info("[dry-run] would upload %s", key)
         return True
@@ -324,16 +394,10 @@ def upload_file(api: Api, dongle_id: str, key: str, fn: str, dry_run: bool) -> b
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Upload recent unuploaded openpilot drives")
-    parser.add_argument(
-        "--days", type=int, default=14, help="How many recent days to scan (default: 14)"
-    )
+    parser.add_argument("--days", type=int, default=14, help="How many recent days to scan (default: 14)")
     parser.add_argument("--dry-run", action="store_true", help="List files but do not upload")
-    parser.add_argument(
-        "--include-dcamera", action="store_true", help="Also upload dcamera.hevc if present"
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Also log progress to stderr"
-    )
+    parser.add_argument("--include-dcamera", action="store_true", help="Also upload dcamera.hevc if present")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Also log progress to stderr")
     return parser.parse_args()
 
 
@@ -343,7 +407,6 @@ def _get_dongle_id() -> str:
     if raw is None:
         log.error("Device not registered (no DongleId)")
         sys.exit(1)
-    # Newer openpilot returns str; older versions may return bytes
     dongle_id = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
     if not dongle_id or dongle_id == "UnregisteredDevice":
         log.error("Device not registered (no DongleId)")
