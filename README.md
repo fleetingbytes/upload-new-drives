@@ -38,14 +38,14 @@ PYTHONPATH=/data/openpilot python3 upload-new-drives.py --include-dcamera
 
 1. Scans `/data/media/0/realdata/` for recent segments.
 2. Skips any file that already has the `user.upload` extended attribute set (local fast path).
-3. For the remaining files, sends them in small batches to `POST /v1/{dongle}/upload_urls/` (device-auth compatible). Paths that come back with a signed URL need uploading; the others are already present and get the xattr marked.
-4. If a batch fails, it falls back to sequential single `GET /v1.4/.../upload_url/` probes (412 = already present) with delays and exponential backoff.
+3. Probes the remaining files one-by-one with `GET /v1.4/{dongle}/upload_url/` (device-auth compatible). A 412 means already present (xattr is set); a 200 means it needs uploading.
+4. Probes are spaced 2.5 s apart. If the server returns too many consecutive 503s the script stops early so it does not interfere with normal web UI use. Unchecked files stay unmarked and will be tried on the next run.
 5. Missing files are uploaded via a signed URL and PUT. On success the `user.upload` attribute is set.
 
-The batch approach reduces the number of API calls by ~40× compared with per-file probes, which helps stay under the server's rate limits.
+The approach is deliberately slow and polite so it stays under the server's rate limits and does not disrupt the Connect web UI.
 
 ## Notes
 
 - Large files (especially camera videos) can take a long time. Leave the device on Wi-Fi and charging.
-- You can safely re-run it; already-uploaded files (local xattr or server confirmation) are skipped.
-- The first run on a large backlog may still take a minute or two for the probe phase; subsequent runs are much faster.
+- You can safely re-run it; already-confirmed files are skipped via the local xattr.
+- If the probe phase stops early because of 503s, wait a few minutes and run it again — progress is saved.

@@ -18,7 +18,6 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import unquote
 
 try:
     from openpilot.common.api import Api
@@ -50,12 +49,11 @@ HTTP_PRECONDITION_FAILED = 412
 SUCCESS_CODES = {HTTP_OK, HTTP_CREATED}
 
 SEGMENT_PARTS = 2
-PROBE_TIMEOUT = 30
-BATCH_SIZE = 40
-BATCH_INTERVAL = 3.0  # seconds between batch calls
-SINGLE_INTERVAL = 1.0  # seconds between single probes
-PROBE_RETRIES = 4
-PROBE_BACKOFF = 5.0  # base seconds, exponential
+PROBE_TIMEOUT = 20
+PROBE_INTERVAL = 2.5  # seconds between successful probes
+PROBE_RETRIES = 2
+PROBE_BACKOFF = 8.0
+MAX_CONSECUTIVE_503 = 5  # stop probing if the server is clearly overloaded
 
 LOG_DIR = Path.home() / ".local" / "state" / "upload-new-drives"
 LOG_FILE = LOG_DIR / "debug.log"
@@ -147,95 +145,8 @@ def _collect_local(root: Path, interesting: list[str], cutoff: datetime) -> list
     return found
 
 
-def _path_from_url(url: str) -> str | None:
-    """Best-effort extract of the original relative path from a signed URL."""
-    try:
-        decoded = unquote(url)
-        # typical: .../dongle/route--N/filename?...
-        parts = decoded.split("/")
-        for i, p in enumerate(parts):
-            if "--" in p and i + 1 < len(parts):
-                return f"{p}/{parts[i + 1].split('?')[0]}"
-    except (ValueError, IndexError, TypeError):
-        pass
-    return None
-
-
-def _batch_probe(
-    api: Api, dongle_id: str, items: list[tuple[str, str]]
-) -> tuple[list[tuple[str, str]], list[tuple[str, str]]] | None:
-    """Try one batch call. Returns (missing, already) or None on failure."""
-    paths = [k for k, _ in items]
-    url = f"https://api.commadotai.com/v1/{dongle_id}/upload_urls/"
-    headers = {
-        "Authorization": "JWT " + api.get_token(),
-        "Content-Type": "application/json",
-        "User-Agent": "upload-new-drives",
-    }
-    body = {"paths": paths, "expiry_days": 1}
-
-    delay = PROBE_BACKOFF
-    for attempt in range(PROBE_RETRIES):
-        t0 = time.monotonic()
-        try:
-            resp = requests.post(url, json=body, headers=headers, timeout=PROBE_TIMEOUT)
-        except requests.RequestException as e:
-            elapsed = time.monotonic() - t0
-            log.debug("batch error attempt %d (%.1fs): %s", attempt + 1, elapsed, e)
-            if attempt + 1 < PROBE_RETRIES:
-                time.sleep(delay)
-                delay *= 2
-                continue
-            return None
-
-        elapsed = time.monotonic() - t0
-        if resp.status_code != HTTP_OK:
-            log.debug("batch -> HTTP %s attempt %d (%.1fs)", resp.status_code, attempt + 1, elapsed)
-            if resp.status_code in (503, 429) and attempt + 1 < PROBE_RETRIES:
-                time.sleep(delay)
-                delay *= 2
-                continue
-            return None
-
-        try:
-            data = resp.json()
-        except (ValueError, requests.JSONDecodeError) as e:
-            log.debug("batch bad JSON: %s", e)
-            return None
-
-        if not isinstance(data, list):
-            log.debug("batch unexpected response type")
-            return None
-
-        returned_paths = set()
-        for item in data:
-            if isinstance(item, dict) and "url" in item:
-                p = _path_from_url(item["url"])
-                if p:
-                    returned_paths.add(p)
-
-        missing = []
-        already = []
-        for key, path in items:
-            if key in returned_paths:
-                missing.append((key, path))
-            else:
-                already.append((key, path))
-
-        log.debug(
-            "batch of %d: %d need upload, %d already present (%.1fs)",
-            len(items),
-            len(missing),
-            len(already),
-            elapsed,
-        )
-        return missing, already
-
-    return None
-
-
-def _single_probe(api: Api, dongle_id: str, key: str) -> bool:
-    """Return True if already uploaded (412)."""
+def _single_probe(api: Api, dongle_id: str, key: str) -> str:
+    """Return 'present', 'missing', or 'error'."""
     delay = PROBE_BACKOFF
     for attempt in range(PROBE_RETRIES):
         t0 = time.monotonic()
@@ -248,75 +159,70 @@ def _single_probe(api: Api, dongle_id: str, key: str) -> bool:
             )
         except requests.RequestException as e:
             elapsed = time.monotonic() - t0
-            log.debug("single probe error %s attempt %d (%.1fs): %s", key, attempt + 1, elapsed, e)
+            log.debug("probe error %s attempt %d (%.1fs): %s", key, attempt + 1, elapsed, e)
             if attempt + 1 < PROBE_RETRIES:
                 time.sleep(delay)
-                delay *= 2
                 continue
-            return False
+            return "error"
 
         elapsed = time.monotonic() - t0
         if resp.status_code == HTTP_PRECONDITION_FAILED:
-            log.debug("single probe %s -> 412 (%.1fs)", key, elapsed)
-            return True
+            log.debug("probe %s -> 412 (%.1fs)", key, elapsed)
+            return "present"
         if resp.status_code == HTTP_OK:
-            log.debug("single probe %s -> 200 (%.1fs)", key, elapsed)
-            return False
-        if resp.status_code in (503, 429) and attempt + 1 < PROBE_RETRIES:
-            log.debug(
-                "single probe %s -> %s attempt %d (%.1fs), retrying",
-                key,
-                resp.status_code,
-                attempt + 1,
-                elapsed,
-            )
-            time.sleep(delay)
-            delay *= 2
-            continue
-        log.debug("single probe %s -> %s (%.1fs)", key, resp.status_code, elapsed)
-        return False
-    return False
+            log.debug("probe %s -> 200 (%.1fs)", key, elapsed)
+            return "missing"
+        if resp.status_code in (503, 429):
+            log.debug("probe %s -> %s attempt %d (%.1fs)", key, resp.status_code, attempt + 1, elapsed)
+            if attempt + 1 < PROBE_RETRIES:
+                time.sleep(delay)
+                continue
+            return "error"
+        log.debug("probe %s -> %s (%.1fs)", key, resp.status_code, elapsed)
+        return "error"
+    return "error"
 
 
 def _filter_present(api: Api, dongle_id: str, candidates: list[tuple[str, str]]) -> list[tuple[str, str]]:
     if not candidates:
         return []
 
-    log.info("probing %d file(s) via batch upload_urls (batch_size=%d)", len(candidates), BATCH_SIZE)
+    log.info("probing %d file(s) sequentially (interval=%.1fs)", len(candidates), PROBE_INTERVAL)
     missing: list[tuple[str, str]] = []
-    already_count = 0
+    consecutive_errors = 0
 
-    for i in range(0, len(candidates), BATCH_SIZE):
-        chunk = candidates[i : i + BATCH_SIZE]
+    for i, (key, path) in enumerate(candidates):
         if i > 0:
-            time.sleep(BATCH_INTERVAL)
+            time.sleep(PROBE_INTERVAL)
 
-        result = _batch_probe(api, dongle_id, chunk)
-        if result is None:
-            log.warning("batch failed for %d files, falling back to single probes", len(chunk))
-            for key, path in chunk:
-                time.sleep(SINGLE_INTERVAL)
-                if _single_probe(api, dongle_id, key):
-                    _mark_uploaded(path)
-                    already_count += 1
-                else:
-                    missing.append((key, path))
+        result = _single_probe(api, dongle_id, key)
+        if result == "present":
+            _mark_uploaded(path)
+            consecutive_errors = 0
+        elif result == "missing":
+            missing.append((key, path))
+            consecutive_errors = 0
         else:
-            chunk_missing, chunk_already = result
-            missing.extend(chunk_missing)
-            for _, path in chunk_already:
-                _mark_uploaded(path)
-                already_count += 1
+            consecutive_errors += 1
+            # leave unmarked so a later run can retry
+            if consecutive_errors >= MAX_CONSECUTIVE_503:
+                log.warning(
+                    "too many consecutive probe errors (%d), stopping early to avoid overloading the server",
+                    consecutive_errors,
+                )
+                # remaining files stay unmarked
+                break
 
-        log.info(
-            "progress: %d/%d checked (%d already, %d missing so far)",
-            min(i + BATCH_SIZE, len(candidates)),
-            len(candidates),
-            already_count,
-            len(missing),
-        )
+        if (i + 1) % 20 == 0 or i + 1 == len(candidates):
+            log.info(
+                "progress: %d/%d checked (%d already, %d missing so far)",
+                i + 1,
+                len(candidates),
+                (i + 1) - len(missing) - consecutive_errors,
+                len(missing),
+            )
 
-    log.info("probe finished: %d missing out of %d", len(missing), len(candidates))
+    log.info("probe finished: %d missing out of %d checked", len(missing), i + 1)
     return missing
 
 
